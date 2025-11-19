@@ -9,10 +9,6 @@ on:
         options: [plan, apply]
         required: true
         default: plan
-      working-directory:
-        description: Path to your Terraform folder
-        required: false
-        default: .
 
 jobs:
   terraform:
@@ -20,7 +16,7 @@ jobs:
     env:
       TF_INPUT: "false"
       TF_IN_AUTOMATION: "true"
-      TF_WORKING_DIR: ${{ inputs.working-directory }}
+      TF_WORKING_DIR: .
 
     steps:
       - uses: actions/checkout@v4
