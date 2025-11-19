@@ -14,4 +14,10 @@ terraform {
       version = "~> 2.5"
     }
   }
+  backend "s3" {
+    bucket  = "amzn-s3-terraform-state-bucket"
+    key     = "cicd-homework-state/terraform.tfstate"
+    region  = "eu-north-1"
+    encrypt = true
+  }
 }

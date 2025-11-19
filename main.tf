@@ -17,14 +17,25 @@ data "aws_ami" "ubuntu" {
   }
 }
 
+locals {
+  common_tags = {
+    owner = "mihai"
+    scope = "homework"
+  }
+}
+
 resource "aws_vpc" "main_vpc" {
   cidr_block = "10.0.0.0/16"
-  tags       = { Name = "main-vpc" }
+  tags = merge(local.common_tags, {
+    Name = "main-vpc"
+  })
 }
 
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main_vpc.id
-  tags   = { Name = "main-igw" }
+  tags = merge(local.common_tags, {
+    Name = "main-igw"
+  })
 }
 
 resource "aws_subnet" "public_subnet" {
@@ -32,7 +43,9 @@ resource "aws_subnet" "public_subnet" {
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "eu-north-1a"
   map_public_ip_on_launch = true
-  tags                    = { Name = "public-subnet" }
+  tags = merge(local.common_tags, {
+    Name = "public-subnet"
+  })
 }
 
 resource "aws_route_table" "public_rt" {
@@ -41,6 +54,10 @@ resource "aws_route_table" "public_rt" {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.igw.id
   }
+
+  tags = merge(local.common_tags, {
+    Name = "public-rt"
+  })
 }
 
 resource "aws_route_table_association" "public_rt_association" {
@@ -68,6 +85,9 @@ resource "local_file" "public_key" {
 resource "aws_key_pair" "deployer" {
   key_name   = "ubuntu_ssh_key"
   public_key = tls_private_key.ssh_key.public_key_openssh
+  tags = merge(local.common_tags, {
+    Name = "ubuntu_ssh_key"
+  })
 }
 
 resource "aws_security_group" "allow_web" {
@@ -101,7 +121,9 @@ resource "aws_security_group" "allow_web" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "allow-web" }
+  tags = merge(local.common_tags, {
+    Name = "allow-web"
+  })
 }
 
 resource "aws_instance" "ubuntu_instance" {
@@ -121,5 +143,7 @@ resource "aws_instance" "ubuntu_instance" {
               systemctl restart nginx
               EOF
 
-  tags = { Name = "ubuntu-instance" }
+  tags = merge(local.common_tags, {
+    Name = "ubuntu-instance"
+  })
 }
