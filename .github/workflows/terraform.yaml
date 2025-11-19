@@ -1,4 +1,4 @@
-name: Terraform
+name: Terraform (OIDC minimal)
 
 on:
   workflow_dispatch:
@@ -21,6 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
@@ -36,9 +42,9 @@ jobs:
       - name: Plan
         if: ${{ inputs.action == 'plan' }}
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform plan -input=false
+        run: terraform plan -input=false -var="region=${{ vars.AWS_REGION }}"
 
-      - name: Apply (main branch only)
+      - name: Apply (main only)
         if: ${{ inputs.action == 'apply' && github.ref == 'refs/heads/main' }}
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform apply -input=false -auto-approve
+        run: terraform apply -input=false -auto-approve -var="region=${{ vars.AWS_REGION }}"
