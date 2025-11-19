@@ -1,0 +1,48 @@
+name: Terraform
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: plan or apply
+        type: choice
+        options: [plan, apply]
+        required: true
+        default: plan
+      working-directory:
+        description: Path to your Terraform folder
+        required: false
+        default: .
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    env:
+      TF_INPUT: "false"
+      TF_IN_AUTOMATION: "true"
+      TF_WORKING_DIR: ${{ inputs.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Plan
+        if: ${{ inputs.action == 'plan' }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -input=false
+
+      - name: Apply (main branch only)
+        if: ${{ inputs.action == 'apply' && github.ref == 'refs/heads/main' }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve
