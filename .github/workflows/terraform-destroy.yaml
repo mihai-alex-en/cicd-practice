@@ -11,6 +11,7 @@ on:
       terraform_version:
         description: Terraform version
         required: false
+        type: string
         default: "1.9.8"
 
 permissions:
@@ -47,7 +48,8 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ inputs.terraform_version }}
 
