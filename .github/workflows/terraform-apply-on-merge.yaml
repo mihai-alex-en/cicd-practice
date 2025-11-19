@@ -1,0 +1,53 @@
+name: Terraform Apply on PR Merge
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  apply:
+    if: ${{ github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: terraform-apply-main
+      cancel-in-progress: false
+    env:
+      TF_INPUT: "false"
+      TF_IN_AUTOMATION: "true"
+      TF_WORKING_DIR: .
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      TF_VAR_region: ${{ secrets.AWS_REGION }}
+
+    steps:
+      - name: Checkout merged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve
