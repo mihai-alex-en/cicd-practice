@@ -1,0 +1,131 @@
+name: Terraform Apply
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "use_artifact = apply using the plan from the latest successful merge; replan = create a new plan from current main"
+        type: choice
+        options:
+          - use_artifact
+          - replan
+        default: use_artifact
+      allow_replan_if_missing:
+        description: "If mode=use_artifact and artifact missing, replan before apply"
+        type: boolean
+        default: false
+      auto_approve:
+        description: "Pass -auto-approve to terraform apply"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: terraform-apply-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve_sha.outputs.sha }}
+      mode: ${{ steps.resolve_sha.outputs.mode }}
+    steps:
+      - id: resolve_sha
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            MODE="use_artifact"
+            SHA="${GITHUB_SHA}"
+          else
+            MODE="${{ inputs.mode }}"
+            SHA=$(git ls-remote https://github.com/${{ github.repository }} refs/heads/main | cut -f1)
+          fi
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+
+  init:
+    runs-on: ubuntu-latest
+    needs: resolve
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+  fetch_artifact:
+    runs-on: ubuntu-latest
+    needs: resolve
+    if: ${{ github.event_name == 'push' || needs.resolve.outputs.mode == 'use_artifact' }}
+    outputs:
+      artifact_found: ${{ steps.fetch.outputs.artifact_found }}
+    steps:
+      - id: fetch
+        run: |
+          set -euo pipefail
+          NAME="tfplan-${{ needs.resolve.outputs.sha }}"
+          echo "${{ github.token }}" | gh auth login --with-token
+          FOUND=""
+          for RUN_ID in $(gh api repos/${{ github.repository }}/actions/runs --paginate --jq '.workflow_runs[].id'); do
+            ART_ID=$(gh api repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts --jq ".artifacts[]? | select(.name==\"${NAME}\") | .id" || true)
+            if [ -n "$ART_ID" ]; then
+              gh api repos/${{ github.repository }}/actions/artifacts/$ART_ID/zip > artifact.zip
+              unzip -o artifact.zip
+              FOUND="yes"
+              break
+            fi
+          done
+          if [ -n "$FOUND" ]; then
+            echo "artifact_found=true" >> $GITHUB_OUTPUT
+          else
+            echo "artifact_found=false" >> $GITHUB_OUTPUT
+          fi
+
+  replan:
+    runs-on: ubuntu-latest
+    needs:
+      - init
+      - fetch_artifact
+    if: ${{ needs.resolve.outputs.mode == 'replan' ||
+            (needs.resolve.outputs.mode == 'use_artifact' &&
+             needs.fetch_artifact.outputs.artifact_found != 'true' &&
+             inputs.allow_replan_if_missing) }}
+    steps:
+      - name: Create a fresh plan
+        run: |
+          terraform plan -out=tfplan.bin -input=false
+          terraform show -no-color tfplan.bin > tfplan.txt
+
+  apply:
+    runs-on: ubuntu-latest
+    needs:
+      - init
+      - fetch_artifact
+      - replan
+    if: ${{ (needs.fetch_artifact.result == 'success' &&
+              needs.fetch_artifact.outputs.artifact_found == 'true') ||
+             needs.replan.result == 'success' }}
+    environment: prod
+    steps:
+      - name: Terraform apply
+        run: terraform apply ${{ inputs.auto_approve && '-auto-approve' || '' }} tfplan.bin
