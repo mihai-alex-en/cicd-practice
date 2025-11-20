@@ -1,29 +1,37 @@
-name: Terraform PR Checks
+name: Check Terraform Integrity on PR
 
 on:
   pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "*.tf"
+      - "*.tfvars"
+      - ".terraform.lock.hcl"
 
 permissions:
-  id-token: write
   contents: read
+  pull-requests: write
+  actions: read
+  id-token: write
 
 jobs:
-  terraform-pr-checks:
+  plan:
     runs-on: ubuntu-latest
-    concurrency:
-      group: terraform-pr-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
     env:
-      TF_INPUT: "false"
       TF_IN_AUTOMATION: "true"
-      TF_WORKING_DIR: .
-      AWS_REGION: ${{ secrets.AWS_REGION }}
       TF_VAR_region: ${{ secrets.AWS_REGION }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout PR merge ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || format('refs/pull/{0}/merge', github.event.pull_request.number) }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -31,22 +39,28 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.9.8
-
-      - name: Terraform format check
-        working-directory: ${{ env.TF_WORKING_DIR }}
+      - name: terraform fmt -check
         run: terraform fmt -check -recursive
 
-      - name: Terraform init
-        working-directory: ${{ env.TF_WORKING_DIR }}
+      - name: terraform init
         run: terraform init -input=false
 
-      - name: Terraform validate
-        working-directory: ${{ env.TF_WORKING_DIR }}
+      - name: terraform validate
         run: terraform validate
 
-      - name: Terraform plan
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform plan -input=false
+      - name: terraform plan
+        id: plan
+        run: |
+          set -euo pipefail
+          terraform plan -out=tfplan.bin -input=false
+          terraform show -no-color tfplan.bin > tfplan.txt
+
+      - name: Upload plan artifact (tfplan-<merge_sha>)
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.event.pull_request.merge_commit_sha }}
+          path: |
+            tfplan.bin
+            tfplan.txt
+          retention-days: 14
