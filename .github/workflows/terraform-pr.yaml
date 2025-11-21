@@ -2,7 +2,7 @@ name: Check Terraform Integrity on PR
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, review_requested]
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "*.tf"
       - "*.tfvars"
