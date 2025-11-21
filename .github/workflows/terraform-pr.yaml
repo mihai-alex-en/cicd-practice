@@ -15,14 +15,57 @@ permissions:
   actions: read
   id-token: write
 
-jobs:
-  plan:
-    runs-on: ubuntu-latest
-    env:
-      TF_IN_AUTOMATION: "true"
-      TF_VAR_region: ${{ secrets.AWS_REGION }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_region: ${{ secrets.AWS_REGION }}
 
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checking out the PR reference
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || format('refs/pull/{0}/merge', github.event.pull_request.number) }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checking out the PR reference
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || format('refs/pull/{0}/merge', github.event.pull_request.number) }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Terraform init (no backend)
+        run: terraform init -backend=false -input=false
+      - name: Terraform validate
+        run: terraform validate
+
+  init:
+    needs: [validate, fmt]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checking out the PR reference
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || format('refs/pull/{0}/merge', github.event.pull_request.number) }}
+      - name: Setting up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - name: Terraform init
+        run: terraform init -input=false
+
+  plan:
+    needs: init
+    runs-on: ubuntu-latest
     steps:
       - name: Checking out the PR merge reference
         uses: actions/checkout@v4
@@ -33,30 +76,18 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
-
-      - name: Configuring AWS credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Checking the format of the Terraform configuration
-        run: terraform fmt -check -recursive
-
-      - name: Initializing the Terraform configuration
-        run: terraform init -input=false
-
-      - name: Validating the Terraform configuration
-        run: terraform validate
-
-      - name: Creating the Terraform plan
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Terraform plan
         id: plan
         run: |
           set -euo pipefail
           terraform plan -out=tfplan.bin -input=false
           terraform show -no-color tfplan.bin > tfplan.txt
-
-      - name: Uploading the plan as artifact (tfplan-<merge_sha>)
+      - name: Upload plan artifact
         if: steps.plan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
