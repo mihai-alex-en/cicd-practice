@@ -15,6 +15,10 @@ env:
   TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
   AWS_REGION: ${{ secrets.AWS_REGION }}
   TF_VAR_region: ${{ secrets.AWS_REGION }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  REPO: ${{ github.repository }}
+  SHA: ${{ github.sha }}
+  WF_NAME: "Check Terraform Integrity on PR"
 
 jobs:
   apply:
@@ -27,13 +31,8 @@ jobs:
 
       - name: Locate merged PR for this commit
         id: pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # List PRs associated with this commit and pick the merged one
           pr_json=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq 'map(select(.merged_at != null)) | .[0]')
           if [ -z "${pr_json:-}" ] || [ "$pr_json" = "null" ]; then
             echo "No merged PR found for commit $SHA"
@@ -52,9 +51,6 @@ jobs:
       - name: Find successful PR CI run for this commit
         id: run
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          WF_NAME: Check Terraform Integrity on PR
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
         run: |
           set -euo pipefail
