@@ -22,6 +22,7 @@ concurrency:
 env:
   TF_IN_AUTOMATION: "true"
   TF_VAR_region: ${{ secrets.AWS_REGION }}
+  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
   AWS_REGION: ${{ secrets.AWS_REGION }}
   TERRAFORM_VERSION: 1.9.8
 
@@ -82,13 +83,13 @@ jobs:
         id: plan
         run: |
           set -euo pipefail
-          terraform plan -out=tfplan.bin -input=false
+          terraform plan -no-color -out=tfplan.bin -input=false
           terraform show -no-color tfplan.bin > tfplan.txt
       - name: Upload plan artifact
         if: steps.plan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: tfplan-${{ github.event.pull_request.merge_commit_sha }}
+          name: tfplan-${{ github.event.pull_request.merge_commit_sha || github.sha }}
           path: |
             tfplan.bin
             tfplan.txt
