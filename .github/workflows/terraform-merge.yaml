@@ -7,62 +7,71 @@ on:
 permissions:
   contents: read
   actions: read
-  pull-requests: read
   id-token: write
 
 env:
+  TF_IN_AUTOMATION: "true"
   TERRAFORM_VERSION: "1.9.8"
+  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
   AWS_REGION: ${{ secrets.AWS_REGION }}
   TF_VAR_region: ${{ secrets.AWS_REGION }}
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  REPO: ${{ github.repository }}
-  SHA: ${{ github.sha }}
-  WF_NAME: "Check Terraform Integrity on PR"
 
 jobs:
   apply:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout main at the pushed commit
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
 
-      - name: Find merged PR
+      - name: Locate merged PR for this commit
         id: pr
-        run: |
-          pr_number=$(gh api repos/$REPO/commits/$SHA/pulls --jq '.[0].number' 2>/dev/null || true)
-          if [ -z "$pr_number" ] || [ "$pr_number" = "null" ]; then
-            echo "No PR found for $SHA"
-            exit 1
-          fi
-          echo "PR #$pr_number"
-          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const sha = context.sha;
+            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner, repo, commit_sha: sha
+            });
+            const pr = prs.data.find(p => p.merged_at);
+            if (!pr) core.setFailed(`No merged PR found for commit ${sha}`);
+            core.info(`Using PR #${pr.number} (head: ${pr.head.sha}, merge: ${pr.merge_commit_sha})`);
+            core.setOutput('number', pr.number);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('head_ref', pr.head.ref);
 
-      - name: Find successful workflow run
+      - name: Find successful PR CI run for this commit
         id: run
-        run: |
-          run_id=$(gh api repos/$REPO/actions/runs \
-            --jq ".workflow_runs | map(select(.name==\"$WF_NAME\" and .conclusion==\"success\")) | map(select((.pull_requests // []) | any(.number == ${{ steps.pr.outputs.number }}))) | sort_by(.run_number) | reverse | .[0].id" \
-            2>/dev/null || true)
-          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
-            echo "No successful run found for PR #${{ steps.pr.outputs.number }}"
-            exit 1
-          fi
-          echo "Using run id $run_id"
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-
-      - uses: hashicorp/setup-terraform@v3
+        uses: actions/github-script@v7
         with:
-          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          script: |
+            const {owner, repo} = context.repo;
+            // Find your PR workflow by NAME
+            const wfList = await github.rest.actions.listRepoWorkflows({ owner, repo });
+            const wf = wfList.data.workflows.find(w => w.name === 'Check Terraform Integrity on PR');
+            if (!wf) core.setFailed('Workflow "Check Terraform Integrity on PR" not found');
 
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+            // List recent runs for that workflow on the PR head branch, event pull_request
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: wf.id,
+              event: 'pull_request',
+              branch: core.getInput('branch') || undefined   // not used; we'll filter below
+            });
 
-      - run: mkdir -p ~/.terraform.d/plugin-cache
+            // Filter to runs created for this PR head ref and take the latest success
+            const headRef = '${{ steps.pr.outputs.head_ref }}';
+            const candidates = runs.data.workflow_runs
+              .filter(r => r.head_branch === headRef && r.conclusion === 'success');
 
-      - uses: actions/download-artifact@v4
+            if (!candidates.length) core.setFailed('No successful PR run found for the merged PR');
+            const ok = candidates[0]; // newest first
+            core.info(`Using run id ${ok.id} on ${ok.head_branch} (${ok.head_sha})`);
+            core.setOutput('run_id', ok.id);
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
         with:
           name: tfplan-pr-${{ steps.pr.outputs.number }}
           path: ./_pr_plan
@@ -70,9 +79,22 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ steps.run.outputs.run_id }}
 
-      - run: terraform init -input=false
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
 
-      - name: Apply the plan
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Init backend (defensive)
+        run: terraform init -input=false
+
+      - name: Apply the PR plan
         run: |
+          set -euo pipefail
           test -f ./_pr_plan/tfplan.bin || { echo "tfplan.bin not found"; exit 1; }
           terraform apply -no-color -input=false ./_pr_plan/tfplan.bin
