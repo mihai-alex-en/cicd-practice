@@ -1,131 +1,91 @@
-name: Terraform Apply
+name: Terraform Apply on Merge
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: "use_artifact = apply using the plan from the latest successful merge; replan = create a new plan from current main"
-        type: choice
-        options:
-          - use_artifact
-          - replan
-        default: use_artifact
-      allow_replan_if_missing:
-        description: "If mode=use_artifact and artifact missing, replan before apply"
-        type: boolean
-        default: false
-      auto_approve:
-        description: "Pass -auto-approve to terraform apply"
-        type: boolean
-        default: true
+    branches: [main]
 
 permissions:
   contents: read
   actions: read
   id-token: write
 
-concurrency:
-  group: terraform-apply-${{ github.ref }}
-  cancel-in-progress: false
+env:
+  TF_IN_AUTOMATION: "true"
+  TERRAFORM_VERSION: "1.9.8"
+  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_VAR_region: ${{ secrets.AWS_REGION }}
 
 jobs:
-  resolve:
+  apply:
     runs-on: ubuntu-latest
-    outputs:
-      sha: ${{ steps.resolve_sha.outputs.sha }}
-      mode: ${{ steps.resolve_sha.outputs.mode }}
     steps:
-      - id: resolve_sha
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            MODE="use_artifact"
-            SHA="${GITHUB_SHA}"
-          else
-            MODE="${{ inputs.mode }}"
-            SHA=$(git ls-remote https://github.com/${{ github.repository }} refs/heads/main | cut -f1)
-          fi
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "mode=$MODE" >> $GITHUB_OUTPUT
-
-  init:
-    runs-on: ubuntu-latest
-    needs: resolve
-    steps:
-      - name: Checkout target commit
+      - name: Checkout main at the pushed commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: ${{ github.sha }}
+
+      - name: Locate merged PR for this commit
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo, sha} = { owner: context.repo.owner, repo: context.repo.repo, sha: context.sha };
+            // PR associated with this merge commit
+            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+            if (!prs.data.length) core.setFailed(`No PR associated with commit ${sha}`);
+            const pr = prs.data.find(p => p.merged_at) || prs.data[0];
+            core.info(`Using PR #${pr.number}`);
+            core.setOutput('number', pr.number);
+
+      - name: Find successful PR CI run for this commit
+        id: run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo, sha} = { owner: context.repo.owner, repo: context.repo.repo, sha: context.sha };
+
+            // Find workflow by name (your PR check workflow)
+            const wfs = await github.rest.actions.listRepoWorkflows({ owner, repo });
+            const wf = wfs.data.workflows.find(w => w.name === 'Check Terraform Integrity on PR');
+            if (!wf) core.setFailed('Workflow "Check Terraform Integrity on PR" not found');
+
+            // List runs for that workflow at this head_sha
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: wf.id, head_sha: sha, event: 'pull_request'
+            });
+
+            // Pick the latest successful run
+            const ok = runs.data.workflow_runs.find(r => r.conclusion === 'success');
+            if (!ok) core.setFailed(`No successful PR run found for ${sha}`);
+            core.info(`Using run ${ok.id}`);
+            core.setOutput('run_id', ok.id);
+
+      - name: Download plan artifact from PR run
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: ./_pr_plan
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.run.outputs.run_id }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.9.8
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Terraform init
+      - name: Init backend (defensive)
         run: terraform init -input=false
 
-  fetch_artifact:
-    runs-on: ubuntu-latest
-    needs: resolve
-    if: ${{ github.event_name == 'push' || needs.resolve.outputs.mode == 'use_artifact' }}
-    outputs:
-      artifact_found: ${{ steps.fetch.outputs.artifact_found }}
-    steps:
-      - id: fetch
+      - name: Apply the PR plan
         run: |
           set -euo pipefail
-          NAME="tfplan-${{ needs.resolve.outputs.sha }}"
-          echo "${{ github.token }}" | gh auth login --with-token
-          FOUND=""
-          for RUN_ID in $(gh api repos/${{ github.repository }}/actions/runs --paginate --jq '.workflow_runs[].id'); do
-            ART_ID=$(gh api repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts --jq ".artifacts[]? | select(.name==\"${NAME}\") | .id" || true)
-            if [ -n "$ART_ID" ]; then
-              gh api repos/${{ github.repository }}/actions/artifacts/$ART_ID/zip > artifact.zip
-              unzip -o artifact.zip
-              FOUND="yes"
-              break
-            fi
-          done
-          if [ -n "$FOUND" ]; then
-            echo "artifact_found=true" >> $GITHUB_OUTPUT
-          else
-            echo "artifact_found=false" >> $GITHUB_OUTPUT
-          fi
-
-  replan:
-    runs-on: ubuntu-latest
-    needs:
-      - init
-      - fetch_artifact
-    if: ${{ needs.resolve.outputs.mode == 'replan' ||
-            (needs.resolve.outputs.mode == 'use_artifact' &&
-             needs.fetch_artifact.outputs.artifact_found != 'true' &&
-             inputs.allow_replan_if_missing) }}
-    steps:
-      - name: Create a fresh plan
-        run: |
-          terraform plan -out=tfplan.bin -input=false
-          terraform show -no-color tfplan.bin > tfplan.txt
-
-  apply:
-    runs-on: ubuntu-latest
-    needs:
-      - init
-      - fetch_artifact
-      - replan
-    if: ${{ (needs.fetch_artifact.result == 'success' &&
-              needs.fetch_artifact.outputs.artifact_found == 'true') ||
-             needs.replan.result == 'success' }}
-    environment: prod
-    steps:
-      - name: Terraform apply
-        run: terraform apply ${{ inputs.auto_approve && '-auto-approve' || '' }} tfplan.bin
+          test -f ./_pr_plan/tfplan.bin || { echo "tfplan.bin not found in artifact"; exit 1; }
+          terraform apply -no-color -input=false ./_pr_plan/tfplan.bin
