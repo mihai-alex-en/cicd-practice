@@ -15,6 +15,7 @@ env:
   TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
   AWS_REGION: ${{ secrets.AWS_REGION }}
   TF_VAR_region: ${{ secrets.AWS_REGION }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   apply:
@@ -27,48 +28,62 @@ jobs:
 
       - name: Locate merged PR for this commit
         id: pr
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const {owner, repo} = context.repo;
-            const sha = context.sha;
-            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-              owner, repo, commit_sha: sha
-            });
-            const pr = prs.data.find(p => p.merged_at);
-            if (!pr) core.setFailed(`No merged PR found for commit ${sha}`);
-            core.info(`Using PR #${pr.number} (head: ${pr.head.sha}, merge: ${pr.merge_commit_sha})`);
-            core.setOutput('number', pr.number);
-            core.setOutput('head_sha', pr.head.sha);
-            core.setOutput('head_ref', pr.head.ref);
+        run: |
+          # Query API for PRs associated with commit, filter for merged ones, take the first
+          PR_DATA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq 'map(select(.merged_at != null)) | first')
+
+          if [ -z "$PR_DATA" ] || [ "$PR_DATA" == "null" ]; then
+            echo "::error::No merged PR found for commit $GITHUB_SHA"
+            exit 1
+          fi
+
+          # Extract data using jq
+          PR_NUMBER=$(echo "$PR_DATA" | jq -r '.number')
+          HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
+          HEAD_REF=$(echo "$PR_DATA" | jq -r '.head.ref')
+          MERGE_SHA=$(echo "$PR_DATA" | jq -r '.merge_commit_sha')
+
+          echo "Using PR #$PR_NUMBER (head: $HEAD_SHA, merge: $MERGE_SHA)"
+
+          # Set outputs
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
 
       - name: Find successful PR CI run for this commit
         id: run
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const {owner, repo} = context.repo;
-            // Find your PR workflow by NAME
-            const wfList = await github.rest.actions.listRepoWorkflows({ owner, repo });
-            const wf = wfList.data.workflows.find(w => w.name === 'Check Terraform Integrity on PR');
-            if (!wf) core.setFailed('Workflow "Check Terraform Integrity on PR" not found');
+        env:
+          TARGET_WORKFLOW_NAME: "Check Terraform Integrity on PR"
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+        run: |
+          # 1. Find the Workflow ID by name
+          # We list all workflows and select the one matching the exact name
+          WF_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq ".workflows[] | select(.name == \"$TARGET_WORKFLOW_NAME\") | .id")
 
-            // List recent runs for that workflow on the PR head branch, event pull_request
-            const runs = await github.rest.actions.listWorkflowRuns({
-              owner, repo, workflow_id: wf.id,
-              event: 'pull_request',
-              branch: core.getInput('branch') || undefined   // not used; we'll filter below
-            });
+          if [ -z "$WF_ID" ]; then
+            echo "::error::Workflow '$TARGET_WORKFLOW_NAME' not found"
+            exit 1
+          fi
 
-            // Filter to runs created for this PR head ref and take the latest success
-            const headRef = '${{ steps.pr.outputs.head_ref }}';
-            const candidates = runs.data.workflow_runs
-              .filter(r => r.head_branch === headRef && r.conclusion === 'success');
+          echo "Found Workflow ID: $WF_ID"
 
-            if (!candidates.length) core.setFailed('No successful PR run found for the merged PR');
-            const ok = candidates[0]; // newest first
-            core.info(`Using run id ${ok.id} on ${ok.head_branch} (${ok.head_sha})`);
-            core.setOutput('run_id', ok.id);
+          # 2. Find the latest successful run for that workflow on the specific branch
+          # We filter by event=pull_request, status=success, and branch=HEAD_REF
+          RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF_ID/runs" \
+            -F event=pull_request \
+            -F status=success \
+            -F branch="$HEAD_REF" \
+            --jq '.workflow_runs[0].id')
+
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" == "null" ]; then
+            echo "::error::No successful PR run found for workflow '$TARGET_WORKFLOW_NAME' on branch '$HEAD_REF'"
+            exit 1
+          fi
+
+          echo "Using run id $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
       - name: Download plan artifact
         uses: actions/download-artifact@v4

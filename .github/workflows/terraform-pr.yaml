@@ -4,16 +4,14 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - "*.tf"
-      - "*.tfvars"
+      - "**/*.tf"
+      - "**/*.tfvars"
       - ".terraform.lock.hcl"
       - "modules/**"
 
 permissions:
   contents: read
-  pull-requests: write
   actions: read
-  id-token: write
 
 concurrency:
   group: terraform-${{ github.event.pull_request.number }}
@@ -21,14 +19,48 @@ concurrency:
 
 env:
   TF_IN_AUTOMATION: "true"
-  TF_VAR_region: ${{ secrets.AWS_REGION }}
   TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
-  AWS_REGION: ${{ secrets.AWS_REGION }}
   TERRAFORM_VERSION: 1.9.8
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  fmt:
+  discover:
+    name: Discover terraform roots
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      lockfile_changed: ${{ steps.diff.outputs.lockfile_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+      - id: roots
+        run: |
+          mapfile -t roots < <(git ls-files | grep -E '\.tf$' | xargs -I{} dirname {} | sort -u)
+          # Filter out module-only directories lacking a backend (optional). Keep all by default.
+          printf '%s\n' "${roots[@]}" > /tmp/roots.txt
+      - id: set-matrix
+        run: |
+          jq -Rn '[inputs | select(length>0)] | {include: ., exclude: []}' < /tmp/roots.txt | tee /tmp/matrix.json
+          echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
+      - id: diff
+        run: |
+          if git diff --name-only origin/${{ github.base_ref }}... | grep -q '^\.terraform\.lock\.hcl$'; then
+            echo "lockfile_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "lockfile_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  fmt:
+    name: terraform fmt
+    runs-on: ubuntu-latest
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,60 +69,156 @@ jobs:
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
       - name: Terraform format check
+        working-directory: ${{ matrix.include }}
         run: terraform fmt -check -recursive
 
   validate:
+    name: terraform validate
     runs-on: ubuntu-latest
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     steps:
-      - name: Checking out the PR reference
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
-      - name: Terraform init (no backend)
-        run: terraform init -backend=false -input=false
-      - name: Terraform validate
-        run: terraform validate
-
-  plan:
-    needs: [validate, fmt]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checking out the PR reference
-        uses: actions/checkout@v4
-        with:
-          ref: refs/pull/${{ github.event.pull_request.number }}/merge
-      - name: Caching Terraform providers
+      - name: Cache provider plugins
         uses: actions/cache@v4
         with:
           path: ~/.terraform.d/plugin-cache
           key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
           restore-keys: |
             tf-plugins-${{ runner.os }}-
+      - name: Terraform init (no backend, verify lockfile)
+        working-directory: ${{ matrix.include }}
+        run: terraform init -backend=false -input=false -lockfile=readonly
+      - name: Terraform validate
+        working-directory: ${{ matrix.include }}
+        run: terraform validate
+
+  lint:
+    name: lint (tflint + tfsec)
+    runs-on: ubuntu-latest
+    needs: discover
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.53.0
+      - name: tflint
+        run: tflint --recursive --format=compact
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1
+        with:
+          format: sarif
+          soft_fail: true
+      - name: Upload tfsec SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+
+  plan:
+    name: terraform plan
+    runs-on: ubuntu-latest
+    needs: [discover, fmt, validate, lint]
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          persist-credentials: false
+
+      - uses: actions/cache@v4
+        name: Cache provider plugins
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            tf-plugins-${{ runner.os }}-
+
+      - uses: actions/cache@v4
+        name: Cache .terraform dirs
+        with:
+          path: |
+            ${{ matrix.include }}/.terraform
+          key: tf-dir-${{ runner.os }}-${{ matrix.include }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            tf-dir-${{ runner.os }}-${{ matrix.include }}-
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
-      - name: Configure AWS credentials
+
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: gha-terraform-plan-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Terraform init
-        run: terraform init -input=false
+
+      - name: Terraform init (verify lockfile)
+        working-directory: ${{ matrix.include }}
+        run: |
+          if [[ "${{ needs.discover.outputs.lockfile_changed }}" == "true" ]]; then
+            terraform init -input=false -upgrade -lockfile=readonly
+          else
+            terraform init -input=false -lockfile=readonly
+          fi
+
       - name: Terraform plan
         id: plan
+        working-directory: ${{ matrix.include }}
         run: |
           set -euo pipefail
-          terraform plan -no-color -out=tfplan.bin -input=false
-          terraform show -no-color tfplan.bin > tfplan.txt
-      - name: Upload plan artifact
-        if: steps.plan.outcome == 'success'
+          terraform plan -no-color -input=false -detailed-exitcode -out=tfplan.bin || ec=$?
+          terraform show -no-color -json tfplan.bin > tfplan.json || true
+          terraform show -no-color tfplan.bin > tfplan.txt || true
+          echo "exitcode=${ec:-0}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tfplan-pr-${{ github.event.pull_request.number }}
+          name: tfplan-${{ github.event.pull_request.number }}-${{ matrix.include || 'root' }}
           path: |
-            tfplan.bin
-            tfplan.txt
+            ${{ matrix.include }}/tfplan.bin
+            ${{ matrix.include }}/tfplan.txt
+            ${{ matrix.include }}/tfplan.json
           retention-days: 14
+
+      - name: Summarize plan
+        if: always()
+        run: |
+          echo "## Terraform plan for \`${{ matrix.include || '.' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${{ steps.plan.outputs.exitcode }}" == "2" ]]; then
+            echo "- Changes detected." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${{ steps.plan.outputs.exitcode }}" == "0" ]]; then
+            echo "- No changes." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Plan failed (see logs)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Comment plan on PR
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          recreate: true
+          header: plan-${{ matrix.include }}
+          message: |
+            **Terraform plan for `${{ matrix.include || '.' }}`**
+            Exit code: ${{ steps.plan.outputs.exitcode }}
+            Artifact: `tfplan-${{ github.event.pull_request.number }}-${{ matrix.include || 'root' }}`
