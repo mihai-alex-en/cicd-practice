@@ -44,8 +44,8 @@ jobs:
           printf '%s\n' "${roots[@]}" > /tmp/roots.txt
       - id: set-matrix
         run: |
-          jq -Rn '[inputs | select(length>0)] | {include: ., exclude: []}' < /tmp/roots.txt | tee /tmp/matrix.json
-          echo "matrix=$(cat /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
+          MATRIX_JSON=$(jq -cRn '[inputs | select(length>0)] | {include: ., exclude: []}' < /tmp/roots.txt)
+          echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
       - id: diff
         run: |
           if git diff --name-only origin/${{ github.base_ref }}... | grep -q '^\.terraform\.lock\.hcl$'; then
