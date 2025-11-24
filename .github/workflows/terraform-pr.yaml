@@ -40,11 +40,10 @@ jobs:
           fetch-depth: 0
       - id: roots
         run: |
-          mapfile -t roots < <(git ls-files | grep -E '\.tf$' | xargs -I{} dirname {} | sort -u)
-          printf '%s\n' "${roots[@]}" > /tmp/roots.txt
+          # Single-root mode: only the repo root "."
+          printf '.\n' > /tmp/roots.txt
       - id: set-matrix
         run: |
-          # Create a JSON object with a 'dir' key containing the list of directories
           MATRIX_JSON=$(jq -cRn '{dir: [inputs | select(length>0)]}' < /tmp/roots.txt)
           echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
 
@@ -193,6 +192,8 @@ jobs:
             terraform show -no-color -json tfplan.bin > tfplan.json || true
             terraform show -no-color tfplan.bin > tfplan.txt || true
           fi
+          # record working directory for apply
+          printf '%s\n' "${{ matrix.dir }}" > cwd.txt
           if [ "$ec" -eq 1 ]; then
             echo "Terraform plan failed."
             exit 1
@@ -216,6 +217,8 @@ jobs:
             ${{ matrix.dir }}/tfplan.bin
             ${{ matrix.dir }}/tfplan.txt
             ${{ matrix.dir }}/tfplan.json
+            ${{ matrix.dir }}/cwd.txt
+            ${{ matrix.dir }}/.terraform.lock.hcl
           retention-days: 14
 
       - name: Generate plan summary

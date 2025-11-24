@@ -147,54 +147,53 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Apply all plans
-        working-directory: ./all_artifacts
         run: |
-          set -e
+          set -euo pipefail
 
-          # The artifact pattern from the PR workflow is: tfplan-pr-{number}-{name}
           PR_NUM="${{ steps.pr.outputs.number }}"
           PREFIX="tfplan-pr-${PR_NUM}-"
 
-          echo "Looking for artifacts starting with: $PREFIX"
+          ART_ROOT="${GITHUB_WORKSPACE}/all_artifacts"
+          REPO_ROOT="${GITHUB_WORKSPACE}"
 
-          # Iterate over directories in the download path
+          shopt -s nullglob
           found_any=false
-          for dir in */ ; do
-            # Remove trailing slash
-            dirname=${dir%/}
-            
-            # Check if this directory name matches our PR pattern
-            if [[ "$dirname" == "$PREFIX"* ]]; then
-              echo "---------------------------------------------------"
-              echo "Processing Artifact: $dirname"
-              
-              # Enter the artifact directory
-              pushd "$dirname" > /dev/null
-              
-              if [ ! -f "tfplan.bin" ]; then
-                echo "::warning::tfplan.bin not found in $dirname, skipping."
-                popd > /dev/null
-                continue
-              fi
 
-              found_any=true
+          for dirname in "$(ls -1 "${ART_ROOT}" | grep -E "^${PREFIX}root$")"; do
+            echo "---------------------------------------------------"
+            echo "Processing Artifact: $dirname"
 
-              # Initialize (needed to download providers for apply)
-              # We use the lockfile from the plan artifact if available, or just init
-              echo "Initializing..."
-              terraform init -input=false
+            PLAN_PATH="${ART_ROOT}/${dirname}/tfplan.bin"
+            CWD_FILE="${ART_ROOT}/${dirname}/cwd.txt"
+            LOCK_PATH="${ART_ROOT}/${dirname}/.terraform.lock.hcl"
 
-              echo "Applying..."
-              terraform apply -no-color -input=false tfplan.bin
+            [[ -f "$PLAN_PATH" ]] || { echo "::error::tfplan.bin not found in $dirname"; exit 1; }
+            [[ -f "$CWD_FILE"  ]] || { echo "::error::cwd.txt not found in $dirname"; exit 1; }
 
-              popd > /dev/null
-              echo "---------------------------------------------------"
-            else
-              echo "Skipping unrelated artifact: $dirname"
+            rel_cwd="$(< "$CWD_FILE")"
+            ABS_CWD="${REPO_ROOT}/${rel_cwd}"
+            [[ -d "$ABS_CWD" ]] || { echo "::error::Resolved module directory does not exist: $ABS_CWD"; exit 1; }
+
+            # Apply from the configuration directory, not inside the artifact
+            pushd "$ABS_CWD" > /dev/null
+
+            # Restore exact provider selections if lock file was uploaded
+            if [[ -f "$LOCK_PATH" ]]; then
+              cp -f "$LOCK_PATH" ./.terraform.lock.hcl
             fi
+
+            echo "Initializing in ${ABS_CWD}..."
+            terraform init -input=false
+
+            echo "Applying ${PLAN_PATH} from ${ABS_CWD}..."
+            terraform apply -no-color -input=false "${PLAN_PATH}"
+
+            popd > /dev/null
+            echo "---------------------------------------------------"
+            found_any=true
           done
 
-          if [ "$found_any" = false ]; then
-             echo "::error::No matching plan artifacts found for PR #$PR_NUM"
-             exit 1
+          if [[ "$found_any" = false ]]; then
+            echo "::error::No matching plan artifacts found for PR #${PR_NUM}"
+            exit 1
           fi
