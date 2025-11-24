@@ -63,40 +63,65 @@ jobs:
             echo "head_ref=${head_ref}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Find successful PR CI run for this commit
+      - name: Find successful PR CI run for this commit (curl)
         id: run
-        env:
-          TARGET_WORKFLOW_NAME: "Check Terraform Integrity on PR"
-          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER_REPO: ${{ github.repository }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          PR_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          TARGET_WORKFLOW_NAME: "Check Terraform Integrity on PR"
         run: |
           set -euo pipefail
+          base="https://api.github.com"
+          owner_repo="$OWNER_REPO"
+          head_ref="$HEAD_REF"
+          pr_head_sha="$PR_HEAD_SHA"
+          wf_name="$TARGET_WORKFLOW_NAME"
 
-          owner_repo="${{ github.repository }}"
-          wf_name='Check Terraform Integrity on PR'
-          head_ref='${{ steps.pr.outputs.head_ref }}'
+          # 1) Resolve workflow ID by name
+          wf_list="$(curl -sS -f \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "${base}/repos/${owner_repo}/actions/workflows")"
 
-          # Find workflow by name
-          wf_list="$(gh api -H 'Accept: application/vnd.github+json' "repos/${owner_repo}/actions/workflows")"
           wf_id="$(jq -r --arg n "$wf_name" '.workflows[] | select(.name==$n) | .id' <<<"$wf_list" | head -n1)"
-          if [ -z "${wf_id:-}" ]; then
+          if [ -z "${wf_id:-}" ] || [ "$wf_id" = "null" ]; then
             echo "Workflow \"$wf_name\" not found"
             exit 1
           fi
 
-          # List runs for pull_request on that branch; newest first by default
-          runs="$(gh api -H 'Accept: application/vnd.github+json' \
-                 "repos/${owner_repo}/actions/workflows/${wf_id}/runs" \
-                 -F event=pull_request -F branch="$head_ref" -F per_page=50)"
+          # 2) Get recent PR runs for that workflow on the PR branch
+          runs_json="$(curl -sS -f \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "${base}/repos/${owner_repo}/actions/workflows/${wf_id}/runs?event=pull_request&branch=${head_ref}&per_page=100")"
 
-          ok="$(jq -r '[.workflow_runs[] | select(.conclusion=="success")] | .[0]' <<<"$runs")"
-          if [ "$ok" = "null" ] || [ -z "$ok" ]; then
+          # 3) Prefer newest successful run that matches the PR's head SHA
+          selected="$(jq -r --arg sha "$pr_head_sha" '
+            [ .workflow_runs[]
+              | select(.conclusion=="success")
+              | select(.head_sha==$sha)
+            ][0]
+          ' <<<"$runs_json")"
+
+          # Fallback: newest successful run on the branch
+          if [ "$selected" = "null" ] || [ -z "$selected" ]; then
+            selected="$(jq -r '
+              [ .workflow_runs[]
+                | select(.conclusion=="success")
+              ][0]
+            ' <<<"$runs_json")"
+          fi
+
+          if [ "$selected" = "null" ] || [ -z "$selected" ]; then
             echo "No successful PR run found for branch ${head_ref}"
             exit 1
           fi
 
-          run_id="$(jq -r '.id' <<<"$ok")"
-          echo "Using run id ${run_id} on $(jq -r '.head_branch' <<<"$ok") ($(jq -r '.head_sha' <<<"$ok"))"
+          run_id="$(jq -r '.id' <<<"$selected")"
+          echo "Using run id ${run_id} on $(jq -r '.head_branch' <<<"$selected") ($(jq -r '.head_sha' <<<"$selected"))"
           echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
 
       - name: Download all plan artifacts
