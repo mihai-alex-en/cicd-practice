@@ -114,7 +114,7 @@ jobs:
       - name: tflint
         run: tflint --recursive --format=compact
       - name: tfsec
-        uses: aquasecurity/tfsec-action@v1
+        uses: aquasecurity/tfsec-action@v1.0.3
         with:
           format: sarif
           soft_fail: true
