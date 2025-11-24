@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Comma-separated jobs to run: fmt, validate, plan, apply"
+        description: "Comma-separated jobs to run: fmt, validate, plan, apply, destroy"
         type: string
         default: "fmt"
       mode:
@@ -23,9 +23,17 @@ on:
         type: boolean
         default: false
       auto_approve:
-        description: "Pass -auto-approve to terraform apply"
+        description: "Pass -auto-approve to terraform apply/destroy"
         type: boolean
         default: true
+      workspace:
+        description: "Terraform workspace to use (blank = default)"
+        type: string
+        default: ""
+      var_file:
+        description: "Optional -var-file (e.g. prod.tfvars)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -125,7 +133,6 @@ jobs:
           retention-days: 14
 
   apply:
-    # Run only if the user requested it
     if: contains(github.event.inputs.jobs, 'apply')
     runs-on: ubuntu-latest
     needs: resolve
@@ -147,7 +154,6 @@ jobs:
       - name: terraform init
         run: terraform init -input=false
 
-      # use_artifact path
       - name: Download plan artifact
         id: fetch_plan
         if: startsWith(github.event.inputs.mode, 'use_artifact')
@@ -192,3 +198,45 @@ jobs:
 
       - name: terraform apply
         run: terraform apply ${{ github.event.inputs.auto_approve == 'true' && '-auto-approve' || '' }} tfplan.bin
+
+  destroy: # <-- added
+    if: contains(github.event.inputs.jobs, 'destroy')
+    runs-on: ubuntu-latest
+    needs: resolve
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init
+        run: terraform init -input=false
+
+      - name: Select workspace (optional)
+        if: ${{ github.event.inputs.workspace != '' }}
+        run: terraform workspace select "${{ github.event.inputs.workspace }}" || terraform workspace new "${{ github.event.inputs.workspace }}"
+
+      - name: terraform destroy
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ -n "${{ github.event.inputs.var_file }}" ]; then
+            EXTRA_ARGS+=("-var-file=${{ github.event.inputs.var_file }}")
+          fi
+          if [ "${{ github.event.inputs.auto_approve }}" = "true" ]; then
+            EXTRA_ARGS+=("-auto-approve")
+          fi
+          EXTRA_ARGS+=("-lock=true" "-lock-timeout=10m" "-parallelism=10")
+          terraform destroy -input=false "${EXTRA_ARGS[@]}"
