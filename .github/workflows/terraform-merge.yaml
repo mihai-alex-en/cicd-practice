@@ -12,7 +12,7 @@ permissions:
 env:
   TF_IN_AUTOMATION: "true"
   TERRAFORM_VERSION: "1.9.8"
-  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+  TF_PLUGIN_CACHE_DIR: /home/runner/.terraform.d/plugin-cache
   AWS_REGION: ${{ secrets.AWS_REGION }}
   TF_VAR_region: ${{ secrets.AWS_REGION }}
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -38,7 +38,6 @@ jobs:
             exit 1
           fi
 
-          # Extract data using jq
           PR_NUMBER=$(echo "$PR_DATA" | jq -r '.number')
           HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
           HEAD_REF=$(echo "$PR_DATA" | jq -r '.head.ref')
@@ -46,7 +45,6 @@ jobs:
 
           echo "Using PR #$PR_NUMBER (head: $HEAD_SHA, merge: $MERGE_SHA)"
 
-          # Set outputs
           echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
@@ -57,25 +55,16 @@ jobs:
           TARGET_WORKFLOW_NAME: "Check Terraform Integrity on PR"
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
         run: |
-          # 1. Find the Workflow ID by name
-          # We list all workflows and select the one matching the exact name
-          WF_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
-            --jq ".workflows[] | select(.name == \"$TARGET_WORKFLOW_NAME\") | .id")
-
-          if [ -z "$WF_ID" ]; then
-            echo "::error::Workflow '$TARGET_WORKFLOW_NAME' not found"
-            exit 1
-          fi
-
-          echo "Found Workflow ID: $WF_ID"
-
-          # 2. Find the latest successful run for that workflow on the specific branch
-          # We filter by event=pull_request, status=success, and branch=HEAD_REF
-          RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF_ID/runs" \
-            -F event=pull_request \
-            -F status=success \
-            -F branch="$HEAD_REF" \
-            --jq '.workflow_runs[0].id')
+          # Use 'gh run list' which is cleaner and handles the API details for us
+          # We filter by Workflow Name, Branch, Event (pull_request) and Status (success)
+          RUN_ID=$(gh run list \
+            --workflow "$TARGET_WORKFLOW_NAME" \
+            --branch "$HEAD_REF" \
+            --event pull_request \
+            --status success \
+            --limit 1 \
+            --json id \
+            --jq '.[0].id')
 
           if [ -z "$RUN_ID" ] || [ "$RUN_ID" == "null" ]; then
             echo "::error::No successful PR run found for workflow '$TARGET_WORKFLOW_NAME' on branch '$HEAD_REF'"
@@ -85,19 +74,21 @@ jobs:
           echo "Using run id $RUN_ID"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Download plan artifact
+      - name: Download all plan artifacts
         uses: actions/download-artifact@v4
         with:
-          name: tfplan-pr-${{ steps.pr.outputs.number }}
-          path: ./_pr_plan
+          run-id: ${{ steps.run.outputs.run_id }}
+          path: ./all_artifacts
           repository: ${{ github.repository }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ steps.run.outputs.run_id }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Create Plugin Cache Dir
+        run: mkdir -p $TF_PLUGIN_CACHE_DIR
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -105,11 +96,55 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Init backend (defensive)
-        run: terraform init -input=false
-
-      - name: Apply the PR plan
+      - name: Apply all plans
+        working-directory: ./all_artifacts
         run: |
-          set -euo pipefail
-          test -f ./_pr_plan/tfplan.bin || { echo "tfplan.bin not found"; exit 1; }
-          terraform apply -no-color -input=false ./_pr_plan/tfplan.bin
+          set -e
+          
+          # The artifact pattern from the PR workflow is: tfplan-pr-{number}-{name}
+          PR_NUM="${{ steps.pr.outputs.number }}"
+          PREFIX="tfplan-pr-${PR_NUM}-"
+
+          echo "Looking for artifacts starting with: $PREFIX"
+
+          # Iterate over directories in the download path
+          found_any=false
+          for dir in */ ; do
+            # Remove trailing slash
+            dirname=${dir%/}
+            
+            # Check if this directory name matches our PR pattern
+            if [[ "$dirname" == "$PREFIX"* ]]; then
+              echo "---------------------------------------------------"
+              echo "Processing Artifact: $dirname"
+              
+              # Enter the artifact directory
+              pushd "$dirname" > /dev/null
+              
+              if [ ! -f "tfplan.bin" ]; then
+                echo "::warning::tfplan.bin not found in $dirname, skipping."
+                popd > /dev/null
+                continue
+              fi
+
+              found_any=true
+
+              # Initialize (needed to download providers for apply)
+              # We use the lockfile from the plan artifact if available, or just init
+              echo "Initializing..."
+              terraform init -input=false
+
+              echo "Applying..."
+              terraform apply -no-color -input=false tfplan.bin
+
+              popd > /dev/null
+              echo "---------------------------------------------------"
+            else
+              echo "Skipping unrelated artifact: $dirname"
+            fi
+          done
+
+          if [ "$found_any" = false ]; then
+             echo "::error::No matching plan artifacts found for PR #$PR_NUM"
+             exit 1
+          fi
