@@ -68,10 +68,6 @@ jobs:
         env:
           TARGET_WORKFLOW_NAME: "Check Terraform Integrity on PR"
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
-        - name: Find successful PR CI run for this commit (bash)
-        id: run
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
