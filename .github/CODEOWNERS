@@ -1,0 +1,14 @@
+# Global default
+*                     @acme/platform
+
+# Directories (note the leading slash anchors to repo root)
+ /infra/terraform/**  @acme/devops
+ /services/auth/**    @acme/backend-auth
+ /web/**              @acme/frontend
+
+# File types and single files
+ *.md                  @acme/tech-writers
+ /README.md            @acme/tech-writers
+
+# Tooling & release process
+ /.github/**           @acme/release-eng
