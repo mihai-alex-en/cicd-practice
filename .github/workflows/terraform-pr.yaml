@@ -37,6 +37,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
       - id: roots
         run: |
           mapfile -t roots < <(git ls-files | grep -E '\.tf$' | xargs -I{} dirname {} | sort -u)
@@ -44,8 +45,7 @@ jobs:
           printf '%s\n' "${roots[@]}" > /tmp/roots.txt
       - id: set-matrix
         run: |
-          # Added -c flag for compact output to fix "Invalid format" error
-          MATRIX_JSON=$(jq -cRn '[inputs | select(length>0)] | {include: ., exclude: []}' < /tmp/roots.txt)
+          MATRIX_JSON=$(jq -cRn '{dir: [inputs | select(length>0)]}' < /tmp/roots.txt)
           echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
       - id: diff
         run: |
@@ -70,7 +70,7 @@ jobs:
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
       - name: Terraform format check
-        working-directory: ${{ matrix.include }}
+        working-directory: ${{ matrix.dir }}
         run: terraform fmt -check -recursive
 
   validate:
@@ -95,10 +95,10 @@ jobs:
           restore-keys: |
             tf-plugins-${{ runner.os }}-
       - name: Terraform init (no backend, verify lockfile)
-        working-directory: ${{ matrix.include }}
+        working-directory: ${{ matrix.dir }}
         run: terraform init -backend=false -input=false -lockfile=readonly
       - name: Terraform validate
-        working-directory: ${{ matrix.include }}
+        working-directory: ${{ matrix.dir }}
         run: terraform validate
 
   lint:
@@ -116,16 +116,16 @@ jobs:
       - uses: terraform-linters/setup-tflint@v4
         with:
           tflint_version: v0.53.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: tflint
         run: tflint --recursive --format=compact
       - name: tfsec
         uses: aquasecurity/tfsec-action@v1.0.3
         with:
-          # Arguments required to generate the file expected by upload-sarif
           additional_args: --format=sarif --out=results.sarif
           soft_fail: true
       - name: Upload tfsec SARIF
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: success() || failure()
         with:
           sarif_file: results.sarif
@@ -162,10 +162,10 @@ jobs:
         name: Cache .terraform dirs
         with:
           path: |
-            ${{ matrix.include }}/.terraform
-          key: tf-dir-${{ runner.os }}-${{ matrix.include }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+            ${{ matrix.dir }}/.terraform
+          key: tf-dir-${{ runner.os }}-${{ matrix.dir }}-${{ hashFiles('**/.terraform.lock.hcl') }}
           restore-keys: |
-            tf-dir-${{ runner.os }}-${{ matrix.include }}-
+            tf-dir-${{ runner.os }}-${{ matrix.dir }}-
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -179,7 +179,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Terraform init (verify lockfile)
-        working-directory: ${{ matrix.include }}
+        working-directory: ${{ matrix.dir }}
         run: |
           if [[ "${{ needs.discover.outputs.lockfile_changed }}" == "true" ]]; then
             terraform init -input=false -upgrade -lockfile=readonly
@@ -189,7 +189,7 @@ jobs:
 
       - name: Terraform plan
         id: plan
-        working-directory: ${{ matrix.include }}
+        working-directory: ${{ matrix.dir }}
         run: |
           set -euo pipefail
           terraform plan -no-color -input=false -detailed-exitcode -out=tfplan.bin || ec=$?
@@ -200,29 +200,27 @@ jobs:
       - name: Sanitize Artifact Name
         id: art_name
         run: |
-           # If matrix.include is '.' (root), name it 'root', otherwise use directory name
-           if [ "${{ matrix.include }}" == "." ]; then
+           if [ "${{ matrix.dir }}" == "." ]; then
              echo "name=root" >> "$GITHUB_OUTPUT"
            else
-             # replace slashes with dashes for artifact name safety
-             CLEAN_NAME=$(echo "${{ matrix.include }}" | sed 's/\//-/g')
+             CLEAN_NAME=$(echo "${{ matrix.dir }}" | sed 's/\//-/g')
              echo "name=${CLEAN_NAME}" >> "$GITHUB_OUTPUT"
            fi
 
       - name: Upload plan artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tfplan-${{ github.event.pull_request.number }}-${{ matrix.include || 'root' }}
+          name: tfplan-pr-${{ github.event.pull_request.number }}-${{ steps.art_name.outputs.name }}
           path: |
-            ${{ matrix.include }}/tfplan.bin
-            ${{ matrix.include }}/tfplan.txt
-            ${{ matrix.include }}/tfplan.json
+            ${{ matrix.dir }}/tfplan.bin
+            ${{ matrix.dir }}/tfplan.txt
+            ${{ matrix.dir }}/tfplan.json
           retention-days: 14
 
       - name: Summarize plan
         if: always()
         run: |
-          echo "## Terraform plan for \`${{ matrix.include }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Terraform plan for \`${{ matrix.dir }}\`" >> "$GITHUB_STEP_SUMMARY"
           if [[ "${{ steps.plan.outputs.exitcode }}" == "2" ]]; then
             echo "- Changes detected." >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${{ steps.plan.outputs.exitcode }}" == "0" ]]; then
@@ -236,8 +234,8 @@ jobs:
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           recreate: true
-          header: plan-${{ matrix.include }}
+          header: plan-${{ matrix.dir }}
           message: |
-            **Terraform plan for `${{ matrix.include }}`**
+            **Terraform plan for `${{ matrix.dir }}`**
             Exit code: ${{ steps.plan.outputs.exitcode }}
-            Artifact: `tfplan-${{ github.event.pull_request.number }}-${{ matrix.include || 'root' }}`
+            Artifact: `tfplan-pr-${{ github.event.pull_request.number }}-${{ steps.art_name.outputs.name }}`
