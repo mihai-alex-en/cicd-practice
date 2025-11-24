@@ -20,7 +20,7 @@ concurrency:
 env:
   TF_IN_AUTOMATION: "true"
   TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
-  TERRAFORM_VERSION: 1.9.8
+  TERRAFORM_VERSION: "1.9.8"
 
 defaults:
   run:
@@ -44,6 +44,7 @@ jobs:
           printf '%s\n' "${roots[@]}" > /tmp/roots.txt
       - id: set-matrix
         run: |
+          # Added -c flag for compact output to fix "Invalid format" error
           MATRIX_JSON=$(jq -cRn '[inputs | select(length>0)] | {include: ., exclude: []}' < /tmp/roots.txt)
           echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
       - id: diff
@@ -104,6 +105,10 @@ jobs:
     name: lint (tflint + tfsec)
     runs-on: ubuntu-latest
     needs: discover
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,10 +121,12 @@ jobs:
       - name: tfsec
         uses: aquasecurity/tfsec-action@v1.0.3
         with:
-          format: sarif
+          # Arguments required to generate the file expected by upload-sarif
+          additional_args: --format=sarif --out=results.sarif
           soft_fail: true
       - name: Upload tfsec SARIF
         uses: github/codeql-action/upload-sarif@v3
+        if: success() || failure()
         with:
           sarif_file: results.sarif
 
@@ -190,6 +197,18 @@ jobs:
           terraform show -no-color tfplan.bin > tfplan.txt || true
           echo "exitcode=${ec:-0}" >> "$GITHUB_OUTPUT"
 
+      - name: Sanitize Artifact Name
+        id: art_name
+        run: |
+           # If matrix.include is '.' (root), name it 'root', otherwise use directory name
+           if [ "${{ matrix.include }}" == "." ]; then
+             echo "name=root" >> "$GITHUB_OUTPUT"
+           else
+             # replace slashes with dashes for artifact name safety
+             CLEAN_NAME=$(echo "${{ matrix.include }}" | sed 's/\//-/g')
+             echo "name=${CLEAN_NAME}" >> "$GITHUB_OUTPUT"
+           fi
+
       - name: Upload plan artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -203,7 +222,7 @@ jobs:
       - name: Summarize plan
         if: always()
         run: |
-          echo "## Terraform plan for \`${{ matrix.include || '.' }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Terraform plan for \`${{ matrix.include }}\`" >> "$GITHUB_STEP_SUMMARY"
           if [[ "${{ steps.plan.outputs.exitcode }}" == "2" ]]; then
             echo "- Changes detected." >> "$GITHUB_STEP_SUMMARY"
           elif [[ "${{ steps.plan.outputs.exitcode }}" == "0" ]]; then
@@ -219,6 +238,6 @@ jobs:
           recreate: true
           header: plan-${{ matrix.include }}
           message: |
-            **Terraform plan for `${{ matrix.include || '.' }}`**
+            **Terraform plan for `${{ matrix.include }}`**
             Exit code: ${{ steps.plan.outputs.exitcode }}
             Artifact: `tfplan-${{ github.event.pull_request.number }}-${{ matrix.include || 'root' }}`
