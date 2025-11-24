@@ -218,17 +218,22 @@ jobs:
             ${{ matrix.dir }}/tfplan.json
           retention-days: 14
 
-      - name: Summarize plan
+      - name: Generate plan summary
+        id: plan_summary
         if: always()
+        working-directory: ${{ matrix.dir }}
         run: |
-          echo "## Terraform plan for \`${{ matrix.dir }}\`" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "${{ steps.plan.outputs.exitcode }}" == "2" ]]; then
-            echo "- Changes detected." >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "${{ steps.plan.outputs.exitcode }}" == "0" ]]; then
-            echo "- No changes." >> "$GITHUB_STEP_SUMMARY"
+          if [ -f tfplan.json ]; then
+            ADDS=$(jq '[.resource_changes[] | select(.change.actions[] == "create")] | length' tfplan.json)
+            CHANGES=$(jq '[.resource_changes[] | select(.change.actions[] == "update")] | length' tfplan.json)
+            DESTROYS=$(jq '[.resource_changes[] | select(.change.actions[] == "delete")] | length' tfplan.json)
           else
-            echo "- Plan failed (see logs)." >> "$GITHUB_STEP_SUMMARY"
+            ADDS=0; CHANGES=0; DESTROYS=0
           fi
+
+          echo "adds=$ADDS" >> "$GITHUB_OUTPUT"
+          echo "changes=$CHANGES" >> "$GITHUB_OUTPUT"
+          echo "destroys=$DESTROYS" >> "$GITHUB_OUTPUT"
 
       - name: Comment plan on PR
         if: always()
@@ -237,6 +242,12 @@ jobs:
           recreate: true
           header: plan-${{ matrix.dir }}
           message: |
-            **Terraform plan for `${{ matrix.dir }}`**
-            Exit code: ${{ steps.plan.outputs.exitcode }}
-            Artifact: `tfplan-pr-${{ github.event.pull_request.number }}-${{ steps.art_name.outputs.name }}`
+            ### Terraform Plan for `${{ matrix.dir }}`
+            **Exit code:** `${{ steps.plan.outputs.exitcode }}`
+            **Terraform version:** `${{ env.TERRAFORM_VERSION }}`
+            **Artifact:** `tfplan-pr-${{ github.event.pull_request.number }}-${{ steps.art_name.outputs.name }}`
+
+            **Resource summary:**
+            - 🟩 Create: ${{ steps.plan_summary.outputs.adds }}
+            - 🟨 Update: ${{ steps.plan_summary.outputs.changes }}
+            - 🟥 Destroy: ${{ steps.plan_summary.outputs.destroys }}
