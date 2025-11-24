@@ -21,6 +21,7 @@ env:
   TF_IN_AUTOMATION: "true"
   TF_PLUGIN_CACHE_DIR: /home/runner/.terraform.d/plugin-cache
   TERRAFORM_VERSION: "1.9.8"
+  TF_VAR_region: ${{ secrets.AWS_REGION }}
 
 defaults:
   run:
@@ -189,12 +190,12 @@ jobs:
       - name: Sanitize Artifact Name
         id: art_name
         run: |
-           if [ "${{ matrix.dir }}" == "." ]; then
-             echo "name=root" >> "$GITHUB_OUTPUT"
-           else
-             CLEAN_NAME=$(echo "${{ matrix.dir }}" | sed 's/\//-/g')
-             echo "name=${CLEAN_NAME}" >> "$GITHUB_OUTPUT"
-           fi
+          if [ "${{ matrix.dir }}" == "." ]; then
+            echo "name=root" >> "$GITHUB_OUTPUT"
+          else
+            CLEAN_NAME=$(echo "${{ matrix.dir }}" | sed 's/\//-/g')
+            echo "name=${CLEAN_NAME}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Upload plan artifacts
         uses: actions/upload-artifact@v4
