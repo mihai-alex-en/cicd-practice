@@ -139,6 +139,7 @@ jobs:
       matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
     env:
       AWS_REGION: ${{ secrets.AWS_REGION }}
+      TF_VAR_region: ${{ secrets.AWS_REGION }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -182,10 +183,20 @@ jobs:
         working-directory: ${{ matrix.dir }}
         run: |
           set -euo pipefail
-          terraform plan -no-color -input=false -detailed-exitcode -out=tfplan.bin || ec=$?
-          terraform show -no-color -json tfplan.bin > tfplan.json || true
-          terraform show -no-color tfplan.bin > tfplan.txt || true
-          echo "exitcode=${ec:-0}" >> "$GITHUB_OUTPUT"
+          if terraform plan -no-color -input=false -detailed-exitcode -out=tfplan.bin; then
+            ec=0
+          else
+            ec=$?   # 1 = error, 2 = changes
+          fi
+          echo "exitcode=$ec" >> "$GITHUB_OUTPUT"
+          if [ -f tfplan.bin ]; then
+            terraform show -no-color -json tfplan.bin > tfplan.json || true
+            terraform show -no-color tfplan.bin > tfplan.txt || true
+          fi
+          if [ "$ec" -eq 1 ]; then
+            echo "Terraform plan failed."
+            exit 1
+          fi
 
       - name: Sanitize Artifact Name
         id: art_name
