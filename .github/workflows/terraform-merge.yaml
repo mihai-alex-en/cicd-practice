@@ -28,51 +28,80 @@ jobs:
 
       - name: Locate merged PR for this commit
         id: pr
+        shell: bash
         run: |
-          # Query API for PRs associated with commit, filter for merged ones, take the first
-          PR_DATA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
-            --jq 'map(select(.merged_at != null)) | first')
+          set -euo pipefail
 
-          if [ -z "$PR_DATA" ] || [ "$PR_DATA" == "null" ]; then
-            echo "::error::No merged PR found for commit $GITHUB_SHA"
+          owner_repo="${{ github.repository }}"
+          sha="${{ github.sha }}"
+
+          # PRs associated with the commit; pick the first that is merged
+          prs_json="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${owner_repo}/commits/${sha}/pulls")"
+
+          if [ "$(jq 'length' <<<"$prs_json")" -eq 0 ]; then
+            echo "No PRs found for commit ${sha}"
             exit 1
           fi
 
-          PR_NUMBER=$(echo "$PR_DATA" | jq -r '.number')
-          HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha')
-          HEAD_REF=$(echo "$PR_DATA" | jq -r '.head.ref')
-          MERGE_SHA=$(echo "$PR_DATA" | jq -r '.merge_commit_sha')
+          pr_obj="$(jq -r '[.[] | select(.merged_at != null)][0]' <<<"$prs_json")"
+          if [ "$pr_obj" = "null" ] || [ -z "$pr_obj" ]; then
+            echo "No merged PR found for commit ${sha}"
+            exit 1
+          fi
 
-          echo "Using PR #$PR_NUMBER (head: $HEAD_SHA, merge: $MERGE_SHA)"
+          number="$(jq -r '.number' <<<"$pr_obj")"
+          head_sha="$(jq -r '.head.sha' <<<"$pr_obj")"
+          head_ref="$(jq -r '.head.ref' <<<"$pr_obj")"
+          merge_commit_sha="$(jq -r '.merge_commit_sha // "-" ' <<<"$pr_obj")"
 
-          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "Using PR #${number} (head: ${head_sha}, merge: ${merge_commit_sha})"
+          {
+            echo "number=${number}"
+            echo "head_sha=${head_sha}"
+            echo "head_ref=${head_ref}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Find successful PR CI run for this commit
         id: run
         env:
           TARGET_WORKFLOW_NAME: "Check Terraform Integrity on PR"
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+        - name: Find successful PR CI run for this commit (bash)
+        id: run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          # Use 'gh run list' which is cleaner and handles the API details for us
-          # We filter by Workflow Name, Branch, Event (pull_request) and Status (success)
-          RUN_ID=$(gh run list \
-            --workflow "$TARGET_WORKFLOW_NAME" \
-            --branch "$HEAD_REF" \
-            --event pull_request \
-            --status success \
-            --limit 1 \
-            --json id \
-            --jq '.[0].id')
+          set -euo pipefail
 
-          if [ -z "$RUN_ID" ] || [ "$RUN_ID" == "null" ]; then
-            echo "::error::No successful PR run found for workflow '$TARGET_WORKFLOW_NAME' on branch '$HEAD_REF'"
+          owner_repo="${{ github.repository }}"
+          wf_name='Check Terraform Integrity on PR'
+          head_ref='${{ steps.pr.outputs.head_ref }}'
+
+          # Find workflow by name
+          wf_list="$(gh api -H 'Accept: application/vnd.github+json' "repos/${owner_repo}/actions/workflows")"
+          wf_id="$(jq -r --arg n "$wf_name" '.workflows[] | select(.name==$n) | .id' <<<"$wf_list" | head -n1)"
+          if [ -z "${wf_id:-}" ]; then
+            echo "Workflow \"$wf_name\" not found"
             exit 1
           fi
 
-          echo "Using run id $RUN_ID"
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          # List runs for pull_request on that branch; newest first by default
+          runs="$(gh api -H 'Accept: application/vnd.github+json' \
+                 "repos/${owner_repo}/actions/workflows/${wf_id}/runs" \
+                 -F event=pull_request -F branch="$head_ref" -F per_page=50)"
+
+          ok="$(jq -r '[.workflow_runs[] | select(.conclusion=="success")] | .[0]' <<<"$runs")"
+          if [ "$ok" = "null" ] || [ -z "$ok" ]; then
+            echo "No successful PR run found for branch ${head_ref}"
+            exit 1
+          fi
+
+          run_id="$(jq -r '.id' <<<"$ok")"
+          echo "Using run id ${run_id} on $(jq -r '.head_branch' <<<"$ok") ($(jq -r '.head_sha' <<<"$ok"))"
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
 
       - name: Download all plan artifacts
         uses: actions/download-artifact@v4
@@ -100,7 +129,7 @@ jobs:
         working-directory: ./all_artifacts
         run: |
           set -e
-          
+
           # The artifact pattern from the PR workflow is: tfplan-pr-{number}-{name}
           PR_NUM="${{ steps.pr.outputs.number }}"
           PREFIX="tfplan-pr-${PR_NUM}-"
