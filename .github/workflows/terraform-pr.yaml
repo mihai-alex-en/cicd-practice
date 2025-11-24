@@ -19,7 +19,7 @@ concurrency:
 
 env:
   TF_IN_AUTOMATION: "true"
-  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+  TF_PLUGIN_CACHE_DIR: /home/runner/.terraform.d/plugin-cache
   TERRAFORM_VERSION: "1.9.8"
 
 defaults:
@@ -32,7 +32,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
-      lockfile_changed: ${{ steps.diff.outputs.lockfile_changed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,19 +40,12 @@ jobs:
       - id: roots
         run: |
           mapfile -t roots < <(git ls-files | grep -E '\.tf$' | xargs -I{} dirname {} | sort -u)
-          # Filter out module-only directories lacking a backend (optional). Keep all by default.
           printf '%s\n' "${roots[@]}" > /tmp/roots.txt
       - id: set-matrix
         run: |
+          # Create a JSON object with a 'dir' key containing the list of directories
           MATRIX_JSON=$(jq -cRn '{dir: [inputs | select(length>0)]}' < /tmp/roots.txt)
           echo "matrix=$MATRIX_JSON" >> "$GITHUB_OUTPUT"
-      - id: diff
-        run: |
-          if git diff --name-only origin/${{ github.base_ref }}... | grep -q '^\.terraform\.lock\.hcl$'; then
-            echo "lockfile_changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "lockfile_changed=false" >> "$GITHUB_OUTPUT"
-          fi
 
   fmt:
     name: terraform fmt
@@ -87,10 +79,12 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - name: Create Plugin Cache Dir
+        run: mkdir -p $TF_PLUGIN_CACHE_DIR
       - name: Cache provider plugins
         uses: actions/cache@v4
         with:
-          path: ~/.terraform.d/plugin-cache
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
           key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
           restore-keys: |
             tf-plugins-${{ runner.os }}-
@@ -149,11 +143,12 @@ jobs:
         with:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
           persist-credentials: false
-
+      - name: Create Plugin Cache Dir
+        run: mkdir -p $TF_PLUGIN_CACHE_DIR
       - uses: actions/cache@v4
         name: Cache provider plugins
         with:
-          path: ~/.terraform.d/plugin-cache
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
           key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
           restore-keys: |
             tf-plugins-${{ runner.os }}-
@@ -161,8 +156,7 @@ jobs:
       - uses: actions/cache@v4
         name: Cache .terraform dirs
         with:
-          path: |
-            ${{ matrix.dir }}/.terraform
+          path: ${{ matrix.dir }}/.terraform
           key: tf-dir-${{ runner.os }}-${{ matrix.dir }}-${{ hashFiles('**/.terraform.lock.hcl') }}
           restore-keys: |
             tf-dir-${{ runner.os }}-${{ matrix.dir }}-
@@ -180,12 +174,7 @@ jobs:
 
       - name: Terraform init (verify lockfile)
         working-directory: ${{ matrix.dir }}
-        run: |
-          if [[ "${{ needs.discover.outputs.lockfile_changed }}" == "true" ]]; then
-            terraform init -input=false -upgrade -lockfile=readonly
-          else
-            terraform init -input=false -lockfile=readonly
-          fi
+        run: terraform init -input=false -lockfile=readonly
 
       - name: Terraform plan
         id: plan
