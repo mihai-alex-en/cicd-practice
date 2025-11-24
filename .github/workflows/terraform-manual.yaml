@@ -3,65 +3,44 @@ name: Terraform Manual Ops
 on:
   workflow_dispatch:
     inputs:
-      # Select which jobs to run (checkbox-style via booleans)
-      run_fmt:
-        description: "Run: terraform fmt"
-        type: boolean
-        default: true
-      run_validate:
-        description: "Run: terraform validate"
-        type: boolean
-        default: false
-      run_plan:
-        description: "Run: terraform plan (save artifact)"
-        type: boolean
-        default: false
-      run_apply:
-        description: "Run: terraform apply (from artifact or replan)"
-        type: boolean
-        default: false
-      run_destroy:
-        description: "Run: terraform destroy"
-        type: boolean
-        default: false
-
-      # Source of code to operate on
-      target_ref:
-        description: "What to run against"
+      operation:
+        description: "Select operation to run"
         type: choice
         options:
-          - main_head
-          - custom_sha
-        default: main_head
-      sha:
-        description: "Commit SHA (used only if target_ref=custom_sha)"
-        type: string
-        default: ""
-
-      # Apply/destroy behavior
+          - fmt
+          - validate
+          - plan
+          - apply
+          - destroy
+          - validate+plan
+          - plan+apply
+          - validate+plan+apply
+        default: fmt
       mode:
-        description: "apply mode: use_artifact = apply tfplan-<sha>; replan = create new plan before apply"
+        description: "apply mode (use_artifact = apply tfplan-<sha>; replan = create new plan before apply)"
         type: choice
         options:
           - use_artifact
           - replan
         default: use_artifact
+      sha:
+        description: "Commit SHA (leave empty for latest main)"
+        type: string
+        default: ""
       allow_replan_if_missing:
-        description: "If mode=use_artifact and plan not found, replan"
+        description: "Replan if artifact missing (for mode=use_artifact)"
         type: boolean
         default: false
       auto_approve:
-        description: "Pass -auto-approve to terraform apply/destroy"
+        description: "Automatically approve apply/destroy"
         type: boolean
         default: true
-
-      # Optional context
       workspace:
-        description: "Terraform workspace (blank = default)"
+        description: "Terraform workspace (optional)"
         type: string
         default: ""
       var_file:
-        description: "Optional -var-file (e.g., prod.tfvars)"
+        description: "Optional -var-file (e.g. prod.tfvars)"
         type: string
         default: ""
 
@@ -80,19 +59,19 @@ jobs:
   resolve:
     runs-on: ubuntu-latest
     outputs:
-      sha: ${{ steps.out.outputs.sha }}
+      sha: ${{ steps.getsha.outputs.sha }}
     steps:
-      - id: out
+      - id: getsha
         run: |
-          if [ "${{ github.event.inputs.target_ref }}" = "custom_sha" ] && [ -n "${{ github.event.inputs.sha }}" ]; then
-            SHA="${{ github.event.inputs.sha }}"
+          if [ -n "${{ inputs.sha }}" ]; then
+            echo "sha=${{ inputs.sha }}" >> "$GITHUB_OUTPUT"
           else
             SHA=$(git ls-remote https://github.com/${{ github.repository }} refs/heads/main | cut -f1)
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           fi
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
 
   fmt:
-    if: ${{ inputs.run_fmt }}
+    if: ${{ inputs.operation == 'fmt' }}
     runs-on: ubuntu-latest
     needs: resolve
     steps:
@@ -102,11 +81,11 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
-      - name: terraform fmt -check
+      - name: terraform fmt
         run: terraform fmt -check -recursive
 
   validate:
-    if: ${{ inputs.run_validate }}
+    if: ${{ contains(inputs.operation, 'validate') }}
     runs-on: ubuntu-latest
     needs: resolve
     steps:
@@ -116,15 +95,12 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
-      - name: Create Plugin Cache Dir
-        run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+      - name: Setup plugin cache
+        run: mkdir -p $TF_PLUGIN_CACHE_DIR
       - uses: actions/cache@v4
-        name: Cache provider plugins
         with:
           path: ${{ env.TF_PLUGIN_CACHE_DIR }}
           key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
-          restore-keys: |
-            tf-plugins-${{ runner.os }}-
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -135,9 +111,9 @@ jobs:
         run: terraform validate -no-color
 
   plan:
-    if: ${{ inputs.run_plan }}
+    if: ${{ contains(inputs.operation, 'plan') }}
     runs-on: ubuntu-latest
-    needs: resolve
+    needs: [resolve]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -145,35 +121,30 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
-      - name: Create Plugin Cache Dir
-        run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
+      - name: Setup plugin cache
+        run: mkdir -p $TF_PLUGIN_CACHE_DIR
       - uses: actions/cache@v4
-        name: Cache provider plugins
         with:
           path: ${{ env.TF_PLUGIN_CACHE_DIR }}
           key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
-          restore-keys: |
-            tf-plugins-${{ runner.os }}-
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - name: terraform init
         run: terraform init -input=false -no-color
-      - name: Select workspace (optional)
+      - name: Select workspace
         if: ${{ inputs.workspace != '' }}
         run: terraform workspace select "${{ inputs.workspace }}" || terraform workspace new "${{ inputs.workspace }}"
       - name: terraform plan
         run: |
-          set -euo pipefail
-          EXTRA_ARGS=()
+          EXTRA=()
           if [ -n "${{ inputs.var_file }}" ]; then
-            EXTRA_ARGS+=("-var-file=${{ inputs.var_file }}")
+            EXTRA+=("-var-file=${{ inputs.var_file }}")
           fi
-          terraform plan -no-color -compact-warnings -input=false -out=tfplan.bin "${EXTRA_ARGS[@]}"
+          terraform plan -no-color -compact-warnings -input=false -out=tfplan.bin "${EXTRA[@]}"
           terraform show -no-color tfplan.bin > tfplan.txt
       - uses: actions/upload-artifact@v4
-        name: Upload plan artifact
         with:
           name: tfplan-${{ needs.resolve.outputs.sha }}
           path: |
@@ -182,9 +153,9 @@ jobs:
           retention-days: 14
 
   apply:
-    if: ${{ inputs.run_apply }}
+    if: ${{ contains(inputs.operation, 'apply') }}
     runs-on: ubuntu-latest
-    needs: resolve
+    needs: [resolve]
     environment: prod
     steps:
       - uses: actions/checkout@v4
@@ -193,30 +164,16 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
-      - name: Create Plugin Cache Dir
-        run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
-      - uses: actions/cache@v4
-        name: Cache provider plugins
-        with:
-          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
-          key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
-          restore-keys: |
-            tf-plugins-${{ runner.os }}-
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - name: terraform init
         run: terraform init -input=false -no-color
-      - name: Select workspace (optional)
-        if: ${{ inputs.workspace != '' }}
-        run: terraform workspace select "${{ inputs.workspace }}" || terraform workspace new "${{ inputs.workspace }}"
 
-      # use_artifact path
       - name: Download plan artifact
         id: fetch_plan
         if: ${{ inputs.mode == 'use_artifact' }}
-        shell: bash
         run: |
           set -euo pipefail
           NAME="tfplan-${{ needs.resolve.outputs.sha }}"
@@ -227,60 +184,34 @@ jobs:
             if [ -n "$ART_ID" ]; then
               gh api repos/${{ github.repository }}/actions/artifacts/$ART_ID/zip > artifact.zip
               unzip -o artifact.zip
-              FOUND="yes"
+              FOUND="true"
               break
             fi
           done
-          if [ -n "$FOUND" ]; then
-            echo "artifact_found=true" >> $GITHUB_OUTPUT
-          else
-            echo "artifact_found=false" >> $GITHUB_OUTPUT
-          fi
+          echo "artifact_found=$FOUND" >> $GITHUB_OUTPUT
 
-      - name: Replan because artifact missing and allowed
+      - name: Replan if missing and allowed
         if: ${{ inputs.mode == 'use_artifact' && steps.fetch_plan.outputs.artifact_found != 'true' && inputs.allow_replan_if_missing }}
-        run: |
-          set -euo pipefail
-          EXTRA_ARGS=()
-          if [ -n "${{ inputs.var_file }}" ]; then
-            EXTRA_ARGS+=("-var-file=${{ inputs.var_file }}")
-          fi
-          terraform plan -no-color -compact-warnings -input=false -out=tfplan.bin "${EXTRA_ARGS[@]}"
-          terraform show -no-color tfplan.bin > tfplan.txt
+        run: terraform plan -input=false -no-color -out=tfplan.bin
 
-      - name: Create fresh plan (mode=replan)
-        if: ${{ inputs.mode == 'replan' }}
-        run: |
-          set -euo pipefail
-          EXTRA_ARGS=()
-          if [ -n "${{ inputs.var_file }}" ]; then
-            EXTRA_ARGS+=("-var-file=${{ inputs.var_file }}")
-          fi
-          terraform plan -no-color -compact-warnings -input=false -out=tfplan.bin "${EXTRA_ARGS[@]}"
-          terraform show -no-color tfplan.bin > tfplan.txt
-
-      - name: Fail if artifact missing and replan not allowed
+      - name: Fail if missing and not allowed
         if: ${{ inputs.mode == 'use_artifact' && steps.fetch_plan.outputs.artifact_found != 'true' && !inputs.allow_replan_if_missing }}
         run: |
-          echo "No matching plan artifact found and replan not allowed."
+          echo "::error::No plan artifact found, and replan not allowed"
           exit 1
-
-      - name: Ensure plan file exists
-        run: |
-          test -f tfplan.bin || { echo "::error::tfplan.bin not found"; exit 1; }
 
       - name: terraform apply
         run: |
-          ARGS=("-input=false" "-no-color" "-lock=true" "-lock-timeout=10m" "-parallelism=10")
+          FLAGS=(-input=false -no-color -lock=true -lock-timeout=10m -parallelism=10)
           if [ "${{ inputs.auto_approve }}" = "true" ]; then
-            ARGS+=("-auto-approve")
+            FLAGS+=(-auto-approve)
           fi
-          terraform apply "${ARGS[@]}" tfplan.bin
+          terraform apply "${FLAGS[@]}" tfplan.bin
 
   destroy:
-    if: ${{ inputs.run_destroy }}
+    if: ${{ inputs.operation == 'destroy' }}
     runs-on: ubuntu-latest
-    needs: resolve
+    needs: [resolve]
     environment: prod
     steps:
       - uses: actions/checkout@v4
@@ -289,32 +220,22 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.8
-      - name: Create Plugin Cache Dir
-        run: mkdir -p "$TF_PLUGIN_CACHE_DIR"
-      - uses: actions/cache@v4
-        name: Cache provider plugins
-        with:
-          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
-          key: tf-plugins-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
-          restore-keys: |
-            tf-plugins-${{ runner.os }}-
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
       - name: terraform init
         run: terraform init -input=false -no-color
-      - name: Select workspace (optional)
+      - name: Select workspace
         if: ${{ inputs.workspace != '' }}
         run: terraform workspace select "${{ inputs.workspace }}" || terraform workspace new "${{ inputs.workspace }}"
       - name: terraform destroy
         run: |
-          set -euo pipefail
-          EXTRA_ARGS=("-input=false" "-no-color" "-lock=true" "-lock-timeout=10m" "-parallelism=10")
+          FLAGS=(-input=false -no-color -lock=true -lock-timeout=10m -parallelism=10)
           if [ -n "${{ inputs.var_file }}" ]; then
-            EXTRA_ARGS+=("-var-file=${{ inputs.var_file }}")
+            FLAGS+=("-var-file=${{ inputs.var_file }}")
           fi
           if [ "${{ inputs.auto_approve }}" = "true" ]; then
-            EXTRA_ARGS+=("-auto-approve")
+            FLAGS+=("-auto-approve")
           fi
-          terraform destroy "${EXTRA_ARGS[@]}"
+          terraform destroy "${FLAGS[@]}"
