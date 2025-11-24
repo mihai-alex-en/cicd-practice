@@ -174,7 +174,7 @@ jobs:
 
       - name: Terraform init (verify lockfile)
         working-directory: ${{ matrix.dir }}
-        run: terraform init -input=false -lockfile=readonly
+        run: terraform init -input=false
 
       - name: Terraform plan
         id: plan
